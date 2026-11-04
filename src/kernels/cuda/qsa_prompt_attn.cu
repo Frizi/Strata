@@ -1920,11 +1920,13 @@ constexpr int WVS = 80;          // staged V row stride in bytes (64 codes, 16-b
 // TR (STRATA_PA_TRIM, experiment): rows = G (12) instead of 16 in part and p. The WMMA's rows 12..15 are zero queries whose scores
 // nothing reads; the kernel never stores or reads them then, and the 12 real rows see the same values in the same order.
 // Less LDS a block = more blocks resident (LDS, not VGPRs, limits the occupancy here: 5 waves a SIMD).
-template <int R, int VS = WVS>
+template <int R, int VS = WVS, bool HYB = false>
 struct alignas(16) SmemWT {
+    struct Empty {};              // the HYB=false instantiation's vsb: zero size, no LDS cost
     float part[4][R][WCH + 1];   // q.k per dim group
     float p[R][WCH + 1];
     float vs[4][WCH];            // V scale per (group, cell)
+    typename std::conditional<HYB, float[4][WCH], Empty>::type vsb;   // hybrid: the second 32-dim block's |d|
     int valid[WCH];              // the cell has a resident pool row
     uint8_t v[4][WCH][VS];       // per wave: the chunk's V codes of its group, one row per cell
     float qmax[4];
@@ -1962,7 +1964,7 @@ __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, ex
 // body is shared by prompt_attn_wmma_kernel and the VGPR-capped copies prompt_attn_wmma_nv<N> (STRATA_PA_NV, experiment:
 // amdgpu_num_vgpr(N) needs a literal, so one stamped kernel per cap).  They only move loads and registers around: the
 // arithmetic, its order and the output bits are the same.
-template <bool SPLIT, bool GATE, bool RPF, int TR>
+template <bool SPLIT, bool GATE, bool RPF, int TR, bool HYB = false>
 __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
@@ -1971,7 +1973,7 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
                                                                    const float* __restrict__ qf,
                                                                    uint16_t* __restrict__ o16, int64_t ld16) {
 #if STRATA_PA_WMMA
-    __shared__ SmemWT<TR ? G : 16, TR >= 2 ? 72 : WVS> S;
+    __shared__ SmemWT<TR ? G : 16, TR >= 2 ? 72 : WVS, HYB> S;
     const int qi = blockIdx.x, kvh = blockIdx.y;
     const int n_head = n_kv_heads * G;
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
@@ -2040,17 +2042,42 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
     struct Chunk {
         long long row;
         uint4 v[4];
-        float vsc, ksc[2];
+        float vsc, vsb, ksc[2];   // vsc: V scale per group; vsb: the second 32-dim block's, hybrid only
         uint32_t kx[2][4][PA_KL / 4];
     };
     auto fetch = [&](long long row, Chunk& d) {
         d.row = row;
         d.v[0] = d.v[1] = d.v[2] = d.v[3] = make_uint4(0, 0, 0, 0);
         d.vsc = 0.0f;
+        d.vsb = 0.0f;
         if (row >= 0) {
-            const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
-            d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
-            d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+            if constexpr (HYB) {
+                // V as two q4_0 blocks of 32 dims: codes to exact int8 (nibble - 8, the block's sign folded in),
+                // and each block's |d| rides on the cell's p per its two 16-dim tiles (0,1 / 2,3) below.
+                const int B4 = (int) sizeof(block_q4_0);
+                const uint8_t* base = p.v_q4 + row * (HD / QK4_0) * B4 + (dim0 / QK4_0) * B4;
+                uint8_t* vv = reinterpret_cast<uint8_t*>(&d.v[0]);
+                float sc[2];
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+                    const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(base + b * B4);
+                    const int neg = (blk->d & 0x8000u) != 0;
+                    sc[b] = __half2float(__ushort_as_half((uint16_t) (blk->d & 0x7FFFu)));
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        int lo = (int) (blk->qs[j] & 0x0F) - 8, hi = (int) (blk->qs[j] >> 4) - 8;
+                        if (neg) { lo = -lo; hi = -hi; }
+                        vv[b * 32 + j] = (uint8_t) (int8_t) lo;
+                        vv[b * 32 + 16 + j] = (uint8_t) (int8_t) hi;
+                    }
+                }
+                d.vsc = sc[0];
+                d.vsb = sc[1];
+            } else {
+                const uint4* src = reinterpret_cast<const uint4*>(p.v_q + row * HD + dim0);
+                d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
+                d.vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + row * (HD / KV_Q8_GROUP) + warp)));
+            }
         }
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -2088,6 +2115,7 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
                 dst[0] = cd.v[0]; dst[1] = cd.v[1]; dst[2] = cd.v[2]; dst[3] = cd.v[3];
             }
             S.vs[warp][lane] = cd.vsc;
+            if constexpr (HYB) S.vsb[warp][lane] = cd.vsb;
             if (warp == 0) S.valid[lane] = cd.row >= 0;
         }
         // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
@@ -2139,7 +2167,9 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
         __syncthreads();
         // p.v over this wave's 64 dims: 4 tiles of 16 dims, 2 k-steps of 16 cells
         {
-            float vmax = S.vs[warp][lane];
+            float vmax;
+            if constexpr (HYB) vmax = fmaxf(S.vs[warp][lane], S.vsb[warp][lane]);
+            else vmax = S.vs[warp][lane];
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
@@ -2149,22 +2179,33 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int cb = ks * 16 + PA_KOFF(half);   // this lane's PA_KL cells
-                wh8 ah, al;
+                // the p fragment is rebuilt per 32-dim block, so its two 16-dim tiles share the block's |d|.
+                constexpr int NB = HYB ? 2 : 1, NJ = HYB ? 2 : 4;
 #pragma unroll
-                for (int i = 0; i < PA_KL; ++i) {
-                    const float pv = (!TR || col < G ? S.p[col][cb + i] : 0.0f) * (S.vs[warp][cb + i] * vup);
-                    const _Float16 hi = (_Float16) pv;
-                    ah[i] = hi;
-                    al[i] = (_Float16) (pv - (float) hi);
-                }
+                for (int b4 = 0; b4 < NB; ++b4) {
+                    wh8 ah, al;
+                    // this block's scale array: dims 0-31 (tiles 0,1) vs 32-63 (tiles 2,3)
+                    const float (*vscale)[WCH];
+                    if constexpr (HYB) vscale = b4 == 0 ? S.vs : S.vsb;
+                    else vscale = S.vs;
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int d = j * 16 + col;
-                    wh8 b;
+                    for (int i = 0; i < PA_KL; ++i) {
+                        const float vsi = vscale[warp][cb + i];
+                        const float pv = (!TR || col < G ? S.p[col][cb + i] : 0.0f) * (vsi * vup);
+                        const _Float16 hi = (_Float16) pv;
+                        ah[i] = hi;
+                        al[i] = (_Float16) (pv - (float) hi);
+                    }
 #pragma unroll
-                    for (int i = 0; i < PA_KL; ++i) b[i] = (_Float16) (int) (int8_t) S.v[warp][cb + i][d];
-                    tmp[j] = wmma_f16(ah, b, tmp[j]);
-                    if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
+                    for (int jj = 0; jj < NJ; ++jj) {
+                        const int j = b4 * NJ + jj;
+                        const int d = j * 16 + col;
+                        wh8 b;
+#pragma unroll
+                        for (int i = 0; i < PA_KL; ++i) b[i] = (_Float16) (int) (int8_t) S.v[warp][cb + i][d];
+                        tmp[j] = wmma_f16(ah, b, tmp[j]);
+                        if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
+                    }
                 }
             }
             float a[8];
@@ -2221,7 +2262,7 @@ __device__ __forceinline__ void prompt_attn_wmma_body(const float* __restrict__ 
     __builtin_trap();
 #endif
 }
-template <bool SPLIT, bool GATE = false, bool RPF = false, int TR = 0>
+template <bool SPLIT, bool GATE = false, bool RPF = false, int TR = 0, bool HYB = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
@@ -2229,7 +2270,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                                                                    float* __restrict__ attn, int cap,
                                                                    const float* __restrict__ qf = nullptr,
                                                                    uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
-    prompt_attn_wmma_body<SPLIT, GATE, RPF, TR>(q, p, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16);
+    prompt_attn_wmma_body<SPLIT, GATE, RPF, TR, HYB>(q, p, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16);
 }
 
 // gfx12 (RDNA4): on by default on Linux (148-amd; STRATA_HIP_WMMA=0 turns it off; Windows: opt-in with =1 until tested there).  gfx11 (RDNA3 / RDNA3.5): only on request
@@ -2298,18 +2339,19 @@ bool hip_wmma_usable(int64_t n_q, int64_t cap) {
 // the kernel's LDS and load-order variants.  The same arithmetic in the same order: the output bits are the same (the
 // checksum of hip_prompt_attn_wmma is equal across them), only the blocks resident a WGP and the load timing change.
 constexpr int PA_TRIM_DEFAULT = 2;
-template <bool SPLIT, bool GATE>
+template <bool SPLIT, bool GATE, bool HYB = false>
 void pa_launch(dim3 grid, cudaStream_t st, const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                int n_kv_heads, int page_size, float scale_log2, float* attn, int cap, const float* qf, uint16_t* o16, int64_t ld16) {
     static const int trim = [] { const char* e = std::getenv("STRATA_PA_TRIM"); return e != nullptr && e[0] != '\0' ? std::atoi(e) : PA_TRIM_DEFAULT; }();
     static const bool rpf = [] { const char* e = std::getenv("STRATA_PA_RPF"); return !(e != nullptr && e[0] == '0'); }();
-#define STRATA_PA_L(R, T) prompt_attn_wmma_kernel<SPLIT, GATE, R, T><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16)
+#define STRATA_PA_L(R, T) prompt_attn_wmma_kernel<SPLIT, GATE, R, T, HYB><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16)
     if (trim >= 2) { if (rpf) STRATA_PA_L(true, 2); else STRATA_PA_L(false, 2); }
     else if (trim == 1) { if (rpf) STRATA_PA_L(true, 1); else STRATA_PA_L(false, 1); }
     else { if (rpf) STRATA_PA_L(true, 0); else STRATA_PA_L(false, 0); }
 #undef STRATA_PA_L
 }
 
+template <bool HYB = false>
 bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                  const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, const float* gate_qf = nullptr,
                  uint16_t* gate_o16 = nullptr, int64_t gate_ld = 0) {
@@ -2354,13 +2396,13 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
             const float* qfq = gate_qf + (size_t) q0 * s.n_head * 2 * HD;
             uint16_t* o16q = gate_o16 + (size_t) q0 * gate_ld;
             if (fast && n_q >= min_t)
-                pa_launch<false, true>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+                pa_launch<false, true, HYB>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
             else
-                pa_launch<true, true>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+                pa_launch<true, true, HYB>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
         } else if (fast && n_q >= min_t)
-            pa_launch<false, false>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
+            pa_launch<false, false, HYB>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
         else
-            pa_launch<true, false>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
+            pa_launch<true, false, HYB>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -2450,7 +2492,11 @@ bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, cons
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
-        return launch_wmma(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
+        return launch_wmma<false>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);   // INT8 K and V (--kv int8)
+    if (pools.k_q != nullptr && pools.v_q4 != nullptr && pools.k_scale != nullptr && pools.k_q4 == nullptr &&
+        s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
+        return launch_wmma<true>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);   // K8V4: int8 K, q4_0 V
 #else
     (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream;
 #endif
@@ -2498,7 +2544,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
-        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+        return launch_wmma<false>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);   // INT8 K and V (--kv int8)
+    if (pools.k_q != nullptr && pools.v_q4 != nullptr && pools.k_scale != nullptr && pools.k_q4 == nullptr &&
+        s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
+        return launch_wmma<true>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);   // K8V4: int8 K, q4_0 V
     return false;
 #endif
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
